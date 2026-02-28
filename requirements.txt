@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]==22.0
+notion-client==2.2.1
+python-dotenv
+pytz
