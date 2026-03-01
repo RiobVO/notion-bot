@@ -29,8 +29,8 @@ DATABASE_ID  = os.getenv("DATABASE_ID", "")
 # Узнать: напиши боту /myid после запуска
 CHAT_ID      = os.getenv("CHAT_ID", "")
 
-if not BOT_TOKEN or not NOTION_TOKEN or not DATABASE_ID:
-    raise RuntimeError("Задай BOT_TOKEN, NOTION_TOKEN, DATABASE_ID в .env файле.")
+if not all([BOT_TOKEN, NOTION_TOKEN, DATABASE_ID]):
+    raise RuntimeError("Required environment variables are not set.")
 
 notion = Client(auth=NOTION_TOKEN)
 
