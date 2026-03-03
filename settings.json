@@ -1,0 +1,20 @@
+{
+  "types": [
+    "Practice",
+    "Theory",
+    "Repeat",
+    "Project"
+  ],
+  "topics": [
+    "SQL",
+    "Python",
+    "Алгоритмы",
+    "Циклы",
+    "Функции",
+    "ООП",
+    "API",
+    "Django",
+    "кукушка",
+    "kukushka"
+  ]
+}
