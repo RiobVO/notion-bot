@@ -348,7 +348,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"/status — сегодня\n"
         f"/week — эта неделя\n"
         f"/summary — месяц\n"
-        f"/streak — серия дней\n\n"
+        f"/streak — серия дней\n"
+        f"/history — последние записи\n\n"
         f"{D}\n"
         f"⚙️  НАСТРОЙКИ\n"
         f"{D}\n"
@@ -479,6 +480,13 @@ async def log_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
     raw = update.message.text
+    # Логируем сам факт получения команды, чтобы на Railway было видно, что апдейт пришёл
+    log_event(
+        "command_log_received",
+        user_id=update.effective_user.id if update.effective_user else None,
+        chat_id=update.effective_chat.id if update.effective_chat else None,
+        text=raw,
+    )
     try:
         clock, entry_type, topic, goal, comment = _parse(raw)
     except ValueError as exc:
@@ -501,7 +509,24 @@ async def log_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     try:
-        await _save(clock, entry_type, topic, goal, comment)
+        # На Railway/хостингах сетевой вызов в Notion может подвиснуть.
+        # Оборачиваем в таймаут, чтобы не зависать бесконечно.
+        await asyncio.wait_for(
+            _save(clock, entry_type, topic, goal, comment),
+            timeout=20,
+        )
+    except asyncio.TimeoutError:
+        logger.exception("Notion save timeout")
+        await update.message.reply_text("❌ Notion очень долго не отвечает. Попробуй ещё раз чуть позже.")
+        log_event(
+            "command_log_timeout",
+            user_id=update.effective_user.id if update.effective_user else None,
+            chat_id=update.effective_chat.id if update.effective_chat else None,
+            clock=clock,
+            entry_type=entry_type,
+            topic=topic,
+        )
+        return
     except Exception as exc:
         logger.exception("Notion save error")
         await update.message.reply_text(f"❌ Ошибка записи в Notion:\n{exc}")
@@ -607,7 +632,14 @@ async def quick_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     comment = "" if text == "—" else text
     d       = context.user_data
     try:
-        await _save(d["clock"], d["type"], d["topic"], d.get("goal"), comment)
+        await asyncio.wait_for(
+            _save(d["clock"], d["type"], d["topic"], d.get("goal"), comment),
+            timeout=20,
+        )
+    except asyncio.TimeoutError:
+        logger.exception("Notion save timeout (quick)")
+        await update.message.reply_text("❌ Notion очень долго не отвечает. Попробуй ещё раз чуть позже.")
+        return ConversationHandler.END
     except Exception as exc:
         logger.exception("Notion save error")
         await update.message.reply_text(f"❌ Ошибка записи в Notion:\n{exc}")
@@ -671,14 +703,27 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    total, lines = 0.0, []
+    total, total_goal, lines = 0.0, 0.0, []
     for e in entries:
         clock = _num(e, CLOCK_PROP) or 0
         goal  = _num(e, GOAL_PROP)
         entry = _title(e, ENTRY_PROP) or _select(e, TYPE_PROP)
         total += clock
+        if goal:
+            total_goal += goal
         bar   = f"\n    {_bar(clock, goal)}" if goal else ""
         lines.append(f"  ▸ {entry}  {clock}ч{bar}")
+
+    extra_goal_text = ""
+    if total_goal > 0:
+        if total >= total_goal:
+            extra_goal_text = f"\n🎯 Цель дня выполнена! ({round(total_goal, 2)} ч)"
+        else:
+            remaining = max(total_goal - total, 0.0)
+            extra_goal_text = (
+                f"\n🎯 Цель дня: {round(total_goal, 2)} ч"
+                f"\n➖ Осталось: {round(remaining, 2)} ч"
+            )
 
     await update.message.reply_text(
         f"{D}\n"
@@ -687,6 +732,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         + "\n".join(lines) +
         f"\n{D}\n"
         f"⏱  Итого:  {round(total, 2)} ч"
+        f"{extra_goal_text}"
     )
     log_event(
         "command_status",
@@ -714,6 +760,7 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     DAY = ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"]
     lines, total = [], 0.0
+    best_day_label, best_day_hours = None, 0.0
     max_h = max(by_date.values()) if by_date else 1
 
     for i in range((today - week_start).days + 1):
@@ -725,9 +772,16 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             filled = round((hours / max_h) * 10)
             bar    = "█" * filled + "░" * (10 - filled)
             lines.append(f"  ✅ {label}  {bar}  {round(hours, 2)}ч")
+            if hours > best_day_hours:
+                best_day_hours = hours
+                best_day_label = label
         else:
             mark = "🔴" if day < today else "⬜"
             lines.append(f"  {mark} {label}  ░░░░░░░░░░  —")
+
+    best_day_text = ""
+    if best_day_label is not None:
+        best_day_text = f"\n🏆 Лучший день: {best_day_label} — {round(best_day_hours, 2)}ч"
 
     await update.message.reply_text(
         f"{D}\n"
@@ -736,16 +790,17 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         + "\n".join(lines) +
         f"\n{D}\n"
         f"⏱  Итого:  {round(total, 2)} ч"
+        f"{best_day_text}"
     )
     log_event(
         "command_week",
         user_id=update.effective_user.id if update.effective_user else None,
         chat_id=update.effective_chat.id if update.effective_chat else None,
         total_hours=round(total, 2),
+        best_day_hours=round(best_day_hours, 2) if best_day_label is not None else 0.0,
     )
 
 
-# ── /summary (итог месяца) ────────────────────────────────────────────────
 
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
@@ -763,6 +818,7 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     total_hours  = 0.0
     by_type:  dict[str, float] = {}
     by_topic: dict[str, float] = {}
+    by_date:  dict[str, float] = {}
     days_active: set[str] = set()
 
     for e in entries:
@@ -778,11 +834,20 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             by_topic[n] = by_topic.get(n, 0) + clock
         if d:
             days_active.add(d)
+            by_date[d] = by_date.get(d, 0) + clock
 
     days_passed = (today - month_start).days + 1
     active_days = len(days_active)
     avg         = round(total_hours / active_days, 2) if active_days else 0
     month_name  = today.strftime("%B %Y").upper()
+
+    best_day_text = ""
+    if by_date:
+        best_date_iso, best_hours = max(by_date.items(), key=lambda x: x[1])
+        best_date = datetime.date.fromisoformat(best_date_iso)
+        best_day_text = (
+            f"🏆 Лучший день: {best_date.strftime('%d.%m.%Y')} — {round(best_hours, 2)}ч\n"
+        )
 
     max_t = max(by_type.values()) if by_type else 1
     type_lines = "\n".join(
@@ -802,6 +867,7 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"⏱  Часов:      {round(total_hours, 2)}\n"
         f"📆  Дней:       {active_days}/{days_passed}\n"
         f"📊  В среднем:  {avg}ч/день\n"
+        f"{best_day_text}"
         f"{D}\n"
         f"🗂  ПО ТИПУ\n{type_lines}\n"
         f"{D}\n"
@@ -851,6 +917,72 @@ async def streak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         streak_days=count,
     )
     await update.message.reply_text(msg)
+
+
+# ── /history ──────────────────────────────────────────────────────────────
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает последние 10 записей из Notion."""
+    if not await _check_auth(update):
+        return
+    today = _today()
+    since = today - timedelta(days=30)
+    entries = await _query_notion(since, today)
+    if not entries:
+        await update.message.reply_text(
+            f"{D}\n"
+            f"🕒 ИСТОРИЯ\n"
+            f"{D}\n"
+            f"За последние 30 дней записей нет.\n"
+            f"{D}"
+        )
+        log_event(
+            "command_history_empty",
+            user_id=update.effective_user.id if update.effective_user else None,
+            chat_id=update.effective_chat.id if update.effective_chat else None,
+        )
+        return
+
+    def _entry_key(page: Dict[str, Any]) -> tuple[datetime.date, datetime.datetime]:
+        d_str = _date_str(page, DATE_PROP) or today.isoformat()
+        d_val = datetime.date.fromisoformat(d_str)
+        created_raw = page.get("created_time") or (d_str + "T00:00:00Z")
+        try:
+            created_dt = datetime.datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+        except ValueError:
+            created_dt = datetime.datetime.combine(d_val, datetime.time.min, tzinfo=TZ)
+        return d_val, created_dt
+
+    sorted_entries = sorted(entries, key=_entry_key, reverse=True)[:10]
+
+    lines: List[str] = []
+    for e in sorted_entries:
+        d_str = _date_str(e, DATE_PROP) or today.isoformat()
+        d_val = datetime.date.fromisoformat(d_str)
+        clock = _num(e, CLOCK_PROP) or 0
+        entry = _title(e, ENTRY_PROP) or _select(e, TYPE_PROP)
+        comment_items = e["properties"].get(COMMENT_PROP, {}).get("rich_text", [])
+        comment_text = comment_items[0]["plain_text"] if comment_items else ""
+        if len(comment_text) > 60:
+            comment_text = comment_text[:57] + "..."
+        lines.append(
+            f"{d_val.strftime('%d.%m.%Y')}  •  {clock}ч  •  {entry}\n"
+            f"💬 {comment_text or '—'}"
+        )
+
+    await update.message.reply_text(
+        f"{D}\n"
+        f"🕒 ИСТОРИЯ (последние {len(sorted_entries)} записей)\n"
+        f"{D}\n"
+        + "\n\n".join(lines) +
+        f"\n{D}"
+    )
+    log_event(
+        "command_history",
+        user_id=update.effective_user.id if update.effective_user else None,
+        chat_id=update.effective_chat.id if update.effective_chat else None,
+        shown=len(sorted_entries),
+    )
 
 
 # ── /topics, /addtopic, /removetopic, /addtype, /removetype ──────────────
@@ -1105,6 +1237,7 @@ def main() -> None:
     app.add_handler(CommandHandler("week",        week))
     app.add_handler(CommandHandler("summary",     summary))
     app.add_handler(CommandHandler("streak",      streak))
+    app.add_handler(CommandHandler("history",     history))
     app.add_handler(CommandHandler("topics",      topics_cmd))
     app.add_handler(CommandHandler("addtopic",    addtopic))
     app.add_handler(CommandHandler("removetopic", removetopic))
@@ -1124,10 +1257,10 @@ def main() -> None:
     # Часовой пояс берётся из TIMEZONE (default='Europe/Moscow')
     if CHAT_ID_INT:
         try:
-            hour   = int(os.getenv("REMINDER_HOUR",   "21"))
+            hour   = int(os.getenv("REMINDER_HOUR",   "17"))
             minute = int(os.getenv("REMINDER_MINUTE", "0"))
         except ValueError:
-            hour, minute = 21, 0
+            hour, minute = 17, 0
         reminder_time = datetime.time(hour, minute, 0, tzinfo=TZ)
         app.job_queue.run_daily(daily_reminder, time=reminder_time)
 
